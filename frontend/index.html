@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>cluster-lens</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>cluster-lens</h1>
+          <p id="context">Connecting...</p>
+        </div>
+        <div class="controls">
+          <label>
+            Namespace
+            <select id="namespaceFilter"></select>
+          </label>
+          <label>
+            Group
+            <select id="groupFilter"></select>
+          </label>
+          <label class="check">
+            <input id="autoRefresh" type="checkbox" checked />
+            Autorefresh
+          </label>
+          <div class="zoom-controls" aria-label="Zoom controls">
+            <button id="zoomOut" type="button">-</button>
+            <button id="zoomReset" type="button">1x</button>
+            <button id="zoomIn" type="button">+</button>
+          </div>
+          <div class="stats" id="stats"></div>
+        </div>
+      </header>
+
+      <section class="workspace">
+        <div class="graph-wrap">
+          <svg id="graph" role="img" aria-label="Cluster topology"></svg>
+        </div>
+        <aside class="inspector" id="inspector">
+          <section>
+            <h2>Legend</h2>
+            <div id="legend" class="legend"></div>
+          </section>
+          <section class="selection">
+            <h2>Selection</h2>
+            <div id="selection">
+              <p class="muted">Click a node, pod, or edge to inspect details.</p>
+            </div>
+          </section>
+        </aside>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

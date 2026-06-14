@@ -1,0 +1,738 @@
+const graph = document.getElementById("graph");
+const inspector = document.getElementById("inspector");
+const selectionEl = document.getElementById("selection");
+const legendEl = document.getElementById("legend");
+const contextEl = document.getElementById("context");
+const statsEl = document.getElementById("stats");
+const namespaceFilter = document.getElementById("namespaceFilter");
+const groupFilter = document.getElementById("groupFilter");
+const autoRefreshToggle = document.getElementById("autoRefresh");
+const zoomOutButton = document.getElementById("zoomOut");
+const zoomResetButton = document.getElementById("zoomReset");
+const zoomInButton = document.getElementById("zoomIn");
+
+const groupColors = [
+  "#2563eb",
+  "#16a34a",
+  "#dc2626",
+  "#9333ea",
+  "#c2410c",
+  "#0891b2",
+  "#be123c",
+  "#4f46e5",
+  "#0f766e",
+  "#a16207",
+];
+
+const nodeRadius = 92;
+const nodePadding = nodeRadius + 44;
+
+let refreshMs = 2000;
+let latestSnapshot = null;
+let autoRefresh = true;
+let selectedNamespace = "all";
+let selectedGroup = "all";
+let zoom = 1;
+let viewCenter = null;
+let panState = null;
+let nodeDragState = null;
+let nodePositionOverrides = new Map();
+let nodePositionContext = "";
+
+init();
+
+async function init() {
+  namespaceFilter.addEventListener("change", () => {
+    selectedNamespace = namespaceFilter.value;
+    selectedGroup = "all";
+    if (latestSnapshot) {
+      syncFilters(latestSnapshot);
+      render(latestSnapshot);
+    }
+  });
+  groupFilter.addEventListener("change", () => {
+    selectedGroup = groupFilter.value;
+    if (latestSnapshot) render(latestSnapshot);
+  });
+  autoRefreshToggle.addEventListener("change", () => {
+    autoRefresh = autoRefreshToggle.checked;
+  });
+  zoomOutButton.addEventListener("click", () => changeZoom(zoom / 1.25));
+  zoomResetButton.addEventListener("click", () => changeZoom(1));
+  zoomInButton.addEventListener("click", () => changeZoom(zoom * 1.25));
+  graph.addEventListener("wheel", handleWheelZoom, { passive: false });
+  graph.addEventListener("pointerdown", startPan);
+  graph.addEventListener("pointermove", movePan);
+  graph.addEventListener("pointerup", endPan);
+  graph.addEventListener("pointercancel", endPan);
+
+  try {
+    const config = await fetchJSON("/api/config");
+    refreshMs = Number(config.refreshMs) || refreshMs;
+  } catch (error) {
+    console.warn(error);
+  }
+  await refresh();
+  setInterval(() => {
+    if (autoRefresh) refresh();
+  }, refreshMs);
+  window.addEventListener("resize", () => {
+    if (latestSnapshot) render(latestSnapshot);
+  });
+}
+
+async function refresh() {
+  try {
+    const snapshot = await fetchJSON("/api/snapshot");
+    latestSnapshot = snapshot;
+    syncFilters(snapshot);
+    render(snapshot);
+  } catch (error) {
+    contextEl.textContent = error.message;
+  }
+}
+
+async function fetchJSON(url) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  return response.json();
+}
+
+function render(snapshot) {
+  const rect = graph.getBoundingClientRect();
+  const width = Math.max(rect.width, 900);
+  const height = Math.max(rect.height, 620);
+  updateViewBox(width, height);
+  clear(graph);
+
+  const visiblePods = filterPods(snapshot.pods);
+  const podsByNode = groupBy(visiblePods, (pod) => pod.node);
+  const nodePositions = layoutNodes(snapshot.nodes, width, height);
+  applyNodePositionOverrides(snapshot.context, nodePositions, width, height);
+  const podPositions = layoutPods(visiblePods, podsByNode, nodePositions);
+  const appPositions = layoutApps(visiblePods, podPositions);
+  const averagedNodeEdges = averageNodeEdges(snapshot.nodeEdges);
+
+  contextEl.textContent = `${snapshot.context} · updated ${new Date(snapshot.generatedAt).toLocaleTimeString()}`;
+  statsEl.innerHTML = [
+    pill(`${snapshot.nodes.length} nodes`),
+    pill(`${visiblePods.length} pods`),
+    pill(`${averagedNodeEdges.length} latency links`),
+    pill(`${countGroups(visiblePods)} groups`),
+  ].join("");
+  renderLegend(visiblePods);
+
+  drawNodeEdges(averagedNodeEdges, nodePositions);
+  drawAppEdges(snapshot.appEdges, appPositions);
+  drawNodes(snapshot.nodes, nodePositions, podsByNode);
+  drawPods(visiblePods, podPositions);
+}
+
+function layoutNodes(nodes, width, height) {
+  const positions = new Map();
+  const centerX = width / 2;
+  const centerY = height / 2;
+  const radius = Math.max(180, Math.min(centerX - nodePadding, centerY - nodePadding, Math.min(width, height) * 0.34));
+  const sorted = [...nodes].sort((a, b) => a.name.localeCompare(b.name));
+  sorted.forEach((node, index) => {
+    const angle = sorted.length === 1 ? -Math.PI / 2 : (Math.PI * 2 * index) / sorted.length - Math.PI / 2;
+    positions.set(node.name, {
+      x: centerX + Math.cos(angle) * radius,
+      y: centerY + Math.sin(angle) * radius,
+    });
+  });
+  return positions;
+}
+
+function layoutPods(pods, podsByNode, nodePositions) {
+  const positions = new Map();
+  for (const [node, nodePods] of podsByNode.entries()) {
+    const center = nodePositions.get(node);
+    if (!center) continue;
+    const radius = nodeRadius + 34;
+    const sorted = [...nodePods].sort((a, b) => a.name.localeCompare(b.name));
+    sorted.forEach((pod, index) => {
+      const angle = sorted.length === 1 ? Math.PI / 2 : (Math.PI * 2 * index) / sorted.length + Math.PI / 2;
+      positions.set(podKey(pod), {
+        x: center.x + Math.cos(angle) * radius,
+        y: center.y + Math.sin(angle) * radius,
+      });
+    });
+  }
+  return positions;
+}
+
+function layoutApps(pods, podPositions) {
+  const pointsByApp = new Map();
+  for (const pod of pods) {
+    const pos = podPositions.get(podKey(pod));
+    if (!pos || !pod.app) continue;
+    const key = `${pod.namespace}/${pod.app}`;
+    if (!pointsByApp.has(key)) pointsByApp.set(key, []);
+    pointsByApp.get(key).push(pos);
+  }
+  const appPositions = new Map();
+  for (const [app, points] of pointsByApp.entries()) {
+    appPositions.set(app, {
+      x: points.reduce((sum, point) => sum + point.x, 0) / points.length,
+      y: points.reduce((sum, point) => sum + point.y, 0) / points.length,
+    });
+  }
+  return appPositions;
+}
+
+function drawNodeEdges(edges, nodePositions) {
+  for (const edge of edges) {
+    const source = nodePositions.get(edge.source);
+    const target = nodePositions.get(edge.target);
+    if (!source || !target) continue;
+    const path = svg("path", {
+      d: curvedPath(source, target, 0),
+      class: "latency-edge edge-hit",
+    });
+    path.addEventListener("click", () => inspect("Latency", edge));
+    graph.append(path);
+
+    const label = curvePoint(source, target, 0);
+    graph.append(svgText(label.x, label.y - 4, edge.label || "", "edge-label"));
+  }
+}
+
+function drawAppEdges(edges, appPositions) {
+  for (const edge of edges) {
+    const source = appPositions.get(edge.source);
+    const target = appPositions.get(edge.target);
+    if (!source || !target) continue;
+    const path = svg("path", {
+      d: curvedPath(source, target, 34),
+      class: "app-edge edge-hit",
+    });
+    path.addEventListener("click", () => inspect("App Link", edge));
+    graph.append(path);
+  }
+}
+
+function drawNodes(nodes, nodePositions, podsByNode) {
+  for (const node of nodes) {
+    const pos = nodePositions.get(node.name);
+    if (!pos) continue;
+    const group = svg("g", { class: "node-hit" });
+    group.addEventListener("click", () => inspect("Node", node));
+    group.addEventListener("pointerdown", (event) => startNodeDrag(event, node.name, pos));
+    group.append(svg("circle", {
+      cx: pos.x,
+      cy: pos.y,
+      r: nodeRadius,
+      class: `node-circle ${node.ready ? "" : "not-ready"}`,
+    }));
+    const labelLines = nodeLabelLines(node.name);
+    labelLines.forEach((line, index) => {
+      const y = pos.y - 31 + index * 13 + (labelLines.length === 1 ? 6 : 0);
+      group.append(svgText(pos.x, y, line, "node-label", "middle"));
+    });
+    group.append(svgText(pos.x, pos.y - 2, `${formatMillicores(node.cpu)} · ${formatBytes(node.memory)}`, "metric-label", "middle"));
+    group.append(svgText(pos.x, pos.y + 17, `${formatRate(node.network)} net`, "metric-label", "middle"));
+    group.append(svgText(pos.x, pos.y + 36, `${(podsByNode.get(node.name) || []).length} pods`, "metric-label", "middle"));
+    graph.append(group);
+  }
+}
+
+function drawPods(pods, podPositions) {
+  for (const pod of pods) {
+    const pos = podPositions.get(podKey(pod));
+    if (!pos) continue;
+    const group = svg("g");
+    group.addEventListener("click", () => inspect("Pod", pod));
+    group.append(svg("circle", {
+      cx: pos.x,
+      cy: pos.y,
+      r: 13,
+      fill: podColor(pod),
+      class: "pod",
+    }));
+    graph.append(group);
+  }
+}
+
+function inspect(title, value) {
+  selectionEl.innerHTML = `<div class="detail">${detailRows({ kind: title, ...value })}</div>`;
+}
+
+function syncFilters(snapshot) {
+  const namespaces = uniqueSorted(snapshot.pods.map((pod) => pod.namespace).filter(Boolean));
+  selectedNamespace = namespaces.includes(selectedNamespace) || selectedNamespace === "all" ? selectedNamespace : "all";
+  setOptions(namespaceFilter, [
+    { value: "all", label: "All namespaces" },
+    ...namespaces.map((namespace) => ({ value: namespace, label: namespace })),
+  ], selectedNamespace);
+
+  const namespacePods = snapshot.pods.filter((pod) => selectedNamespace === "all" || pod.namespace === selectedNamespace);
+  const groups = uniqueSorted(namespacePods.map((pod) => pod.group).filter(Boolean));
+  const hasUngrouped = namespacePods.some((pod) => !pod.group);
+  const groupOptions = [
+    { value: "all", label: "All groups" },
+    ...groups.map((group) => ({ value: group, label: group })),
+  ];
+  if (hasUngrouped) groupOptions.push({ value: "__unlabeled", label: "Unlabeled" });
+  selectedGroup = groupOptions.some((option) => option.value === selectedGroup) ? selectedGroup : "all";
+  setOptions(groupFilter, groupOptions, selectedGroup);
+}
+
+function setOptions(select, options, selected) {
+  const current = Array.from(select.options).map((option) => `${option.value}:${option.textContent}`).join("|");
+  const next = options.map((option) => `${option.value}:${option.label}`).join("|");
+  if (current !== next) {
+    select.innerHTML = options
+      .map((option) => `<option value="${escapeHTML(option.value)}">${escapeHTML(option.label)}</option>`)
+      .join("");
+  }
+  select.value = selected;
+}
+
+function filterPods(pods) {
+  return pods.filter((pod) => {
+    if (selectedNamespace !== "all" && pod.namespace !== selectedNamespace) return false;
+    if (selectedGroup === "all") return true;
+    if (selectedGroup === "__unlabeled") return !pod.group;
+    return pod.group === selectedGroup;
+  });
+}
+
+function averageNodeEdges(edges) {
+  const pairs = new Map();
+  for (const edge of edges) {
+    const names = [edge.source, edge.target].sort((a, b) => a.localeCompare(b));
+    const key = names.join("::");
+    if (!pairs.has(key)) {
+      pairs.set(key, {
+        source: names[0],
+        target: names[1],
+        kind: "latency",
+        values: [],
+      });
+    }
+    const pair = pairs.get(key);
+    if (Number.isFinite(edge.value)) pair.values.push(edge.value);
+  }
+
+  return [...pairs.values()].map((pair) => {
+    const value = pair.values.reduce((sum, next) => sum + next, 0) / Math.max(1, pair.values.length);
+    return {
+      source: pair.source,
+      target: pair.target,
+      kind: pair.kind,
+      value,
+      samples: pair.values.length,
+      label: formatLatency(value),
+    };
+  });
+}
+
+function changeZoom(nextZoom, focus = null) {
+  const rect = graph.getBoundingClientRect();
+  const width = Math.max(rect.width, 900);
+  const height = Math.max(rect.height, 620);
+  const next = clamp(nextZoom, 0.5, 3);
+
+  if (next === 1 && !focus) {
+    viewCenter = null;
+  } else if (focus) {
+    viewCenter = zoomAroundPoint(focus, next, rect, width, height);
+  } else {
+    viewCenter = currentViewCenter(width, height);
+  }
+
+  zoom = next;
+  zoomResetButton.textContent = `${zoom.toFixed(zoom === 1 ? 0 : 1)}x`;
+  if (latestSnapshot) render(latestSnapshot);
+}
+
+function handleWheelZoom(event) {
+  event.preventDefault();
+  const factor = event.deltaY < 0 ? 1.16 : 1 / 1.16;
+  changeZoom(zoom * factor, { x: event.clientX, y: event.clientY });
+}
+
+function startPan(event) {
+  if (event.button !== 0) return;
+  if (nodeDragState) return;
+  if (event.target !== graph) return;
+  panState = {
+    pointerId: event.pointerId,
+    x: event.clientX,
+    y: event.clientY,
+  };
+  graph.setPointerCapture(event.pointerId);
+  graph.classList.add("is-panning");
+}
+
+function movePan(event) {
+  if (!panState || panState.pointerId !== event.pointerId) return;
+  const dx = event.clientX - panState.x;
+  const dy = event.clientY - panState.y;
+  panState.x = event.clientX;
+  panState.y = event.clientY;
+  panBy(dx, dy);
+}
+
+function endPan(event) {
+  if (!panState || panState.pointerId !== event.pointerId) return;
+  graph.releasePointerCapture(event.pointerId);
+  graph.classList.remove("is-panning");
+  panState = null;
+}
+
+function panBy(dx, dy) {
+  const rect = graph.getBoundingClientRect();
+  const width = Math.max(rect.width, 900);
+  const height = Math.max(rect.height, 620);
+  const center = currentViewCenter(width, height);
+  const viewWidth = width / zoom;
+  const viewHeight = height / zoom;
+  const scaleX = rect.width > 0 ? viewWidth / rect.width : 1;
+  const scaleY = rect.height > 0 ? viewHeight / rect.height : 1;
+
+  viewCenter = {
+    x: center.x - dx * scaleX,
+    y: center.y - dy * scaleY,
+  };
+  updateViewBox(width, height);
+}
+
+function startNodeDrag(event, nodeName, position) {
+  if (event.button !== 0) return;
+  event.stopPropagation();
+  const point = clientToGraphPoint(event.clientX, event.clientY);
+  nodeDragState = {
+    pointerId: event.pointerId,
+    nodeName,
+    nodeValue: latestSnapshot?.nodes.find((node) => node.name === nodeName),
+    moved: false,
+    offsetX: point.x - position.x,
+    offsetY: point.y - position.y,
+  };
+  graph.setPointerCapture(event.pointerId);
+  graph.classList.add("is-dragging-node");
+  graph.addEventListener("pointermove", moveNodeDrag);
+  graph.addEventListener("pointerup", endNodeDrag);
+  graph.addEventListener("pointercancel", endNodeDrag);
+}
+
+function moveNodeDrag(event) {
+  if (!nodeDragState || nodeDragState.pointerId !== event.pointerId) return;
+  event.stopPropagation();
+  const rect = graph.getBoundingClientRect();
+  const width = Math.max(rect.width, 900);
+  const height = Math.max(rect.height, 620);
+  const point = clientToGraphPoint(event.clientX, event.clientY);
+  const x = clamp(point.x - nodeDragState.offsetX, nodeRadius, width - nodeRadius);
+  const y = clamp(point.y - nodeDragState.offsetY, nodeRadius, height - nodeRadius);
+  nodeDragState.moved = true;
+  nodePositionOverrides.set(nodeDragState.nodeName, { x, y });
+  saveNodePositionOverrides();
+  if (latestSnapshot) render(latestSnapshot);
+}
+
+function endNodeDrag(event) {
+  if (!nodeDragState || nodeDragState.pointerId !== event.pointerId) return;
+  event.stopPropagation();
+  graph.releasePointerCapture(event.pointerId);
+  graph.classList.remove("is-dragging-node");
+  graph.removeEventListener("pointermove", moveNodeDrag);
+  graph.removeEventListener("pointerup", endNodeDrag);
+  graph.removeEventListener("pointercancel", endNodeDrag);
+  const wasMoved = nodeDragState.moved;
+  const nodeValue = nodeDragState.nodeValue;
+  nodeDragState = null;
+  if (wasMoved) {
+    event.preventDefault();
+  } else if (nodeValue) {
+    inspect("Node", nodeValue);
+  }
+}
+
+function clientToGraphPoint(clientX, clientY) {
+  const rect = graph.getBoundingClientRect();
+  const viewBox = graph.viewBox.baseVal;
+  const ratioX = rect.width > 0 ? (clientX - rect.left) / rect.width : 0.5;
+  const ratioY = rect.height > 0 ? (clientY - rect.top) / rect.height : 0.5;
+  return {
+    x: viewBox.x + ratioX * viewBox.width,
+    y: viewBox.y + ratioY * viewBox.height,
+  };
+}
+
+function applyNodePositionOverrides(context, nodePositions, width, height) {
+  ensureNodePositionContext(context);
+  for (const [nodeName, position] of nodePositionOverrides.entries()) {
+    if (!nodePositions.has(nodeName)) continue;
+    nodePositions.set(nodeName, {
+      x: clamp(position.x, 78, width - 78),
+      y: clamp(position.y, nodeRadius, height - nodeRadius),
+    });
+  }
+}
+
+function ensureNodePositionContext(context) {
+  if (nodePositionContext === context) return;
+  nodePositionContext = context || "default";
+  nodePositionOverrides = loadNodePositionOverrides();
+}
+
+function nodePositionsStorageKey() {
+  return `cluster-lens.node-positions.${nodePositionContext || "default"}`;
+}
+
+function loadNodePositionOverrides() {
+  try {
+    const stored = window.localStorage.getItem(nodePositionsStorageKey());
+    if (!stored) return new Map();
+    return new Map(Object.entries(JSON.parse(stored)));
+  } catch (error) {
+    console.warn(error);
+    return new Map();
+  }
+}
+
+function saveNodePositionOverrides() {
+  try {
+    window.localStorage.setItem(
+      nodePositionsStorageKey(),
+      JSON.stringify(Object.fromEntries(nodePositionOverrides.entries())),
+    );
+  } catch (error) {
+    console.warn(error);
+  }
+}
+
+function updateViewBox(width, height) {
+  const center = currentViewCenter(width, height);
+  const viewWidth = width / zoom;
+  const viewHeight = height / zoom;
+  graph.setAttribute("viewBox", `${center.x - viewWidth / 2} ${center.y - viewHeight / 2} ${viewWidth} ${viewHeight}`);
+}
+
+function currentViewCenter(width, height) {
+  const fallback = { x: width / 2, y: height / 2 };
+  if (!viewCenter) return fallback;
+  const viewWidth = width / zoom;
+  const viewHeight = height / zoom;
+  return {
+    x: clamp(viewCenter.x, viewWidth / 2, width - viewWidth / 2),
+    y: clamp(viewCenter.y, viewHeight / 2, height - viewHeight / 2),
+  };
+}
+
+function zoomAroundPoint(focus, nextZoom, rect, width, height) {
+  const currentCenter = currentViewCenter(width, height);
+  const currentViewWidth = width / zoom;
+  const currentViewHeight = height / zoom;
+  const nextViewWidth = width / nextZoom;
+  const nextViewHeight = height / nextZoom;
+  const ratioX = rect.width > 0 ? (focus.x - rect.left) / rect.width : 0.5;
+  const ratioY = rect.height > 0 ? (focus.y - rect.top) / rect.height : 0.5;
+  const focusX = currentCenter.x - currentViewWidth / 2 + ratioX * currentViewWidth;
+  const focusY = currentCenter.y - currentViewHeight / 2 + ratioY * currentViewHeight;
+
+  return {
+    x: clamp(focusX - (ratioX - 0.5) * nextViewWidth, nextViewWidth / 2, width - nextViewWidth / 2),
+    y: clamp(focusY - (ratioY - 0.5) * nextViewHeight, nextViewHeight / 2, height - nextViewHeight / 2),
+  };
+}
+
+function renderLegend(pods) {
+  const groupItems = uniqueSorted(pods.map((pod) => pod.group).filter(Boolean))
+    .map((group) => legendItem(group, colorFor(`group:${group}`)));
+  if (pods.some((pod) => !pod.group)) {
+    groupItems.push(legendItem("Unlabeled group", unlabeledColor()));
+  }
+
+  const appItems = uniqueSorted(pods.map((pod) => pod.app).filter(Boolean))
+    .map((app) => legendItem(app, colorFor(`app:${app}`)));
+  if (pods.some((pod) => !pod.app)) {
+    appItems.push(legendItem("Unlabeled app", unlabeledColor()));
+  }
+
+  legendEl.innerHTML = [
+    legendGroup("Groups", groupItems),
+    legendGroup("Apps", appItems),
+  ].join("");
+}
+
+function legendGroup(title, items) {
+  return `
+    <div class="legend-group">
+      <div class="legend-title">${escapeHTML(title)}</div>
+      ${items.length ? items.join("") : '<p class="muted">No visible pods.</p>'}
+    </div>
+  `;
+}
+
+function legendItem(label, color) {
+  return `
+    <div class="legend-item">
+      <span class="swatch" style="background:${escapeHTML(color)}"></span>
+      <span>${escapeHTML(label)}</span>
+    </div>
+  `;
+}
+
+function detailRows(value) {
+  return Object.entries(flatten(value))
+    .map(([key, val]) => `
+      <div class="detail-row">
+        <strong>${escapeHTML(key)}</strong>
+        <code>${escapeHTML(String(val))}</code>
+      </div>
+    `)
+    .join("");
+}
+
+function flatten(value, prefix = "", out = {}) {
+  if (!value || typeof value !== "object") return out;
+  for (const [key, val] of Object.entries(value)) {
+    const next = prefix ? `${prefix}.${key}` : key;
+    if (val && typeof val === "object" && !Array.isArray(val)) {
+      flatten(val, next, out);
+    } else if (Array.isArray(val)) {
+      out[next] = val.join(", ");
+    } else {
+      out[next] = val ?? "";
+    }
+  }
+  return out;
+}
+
+function groupBy(items, fn) {
+  const out = new Map();
+  for (const item of items) {
+    const key = fn(item) || "";
+    if (!out.has(key)) out.set(key, []);
+    out.get(key).push(item);
+  }
+  return out;
+}
+
+function countGroups(pods) {
+  return new Set(pods.map((pod) => pod.group).filter(Boolean)).size;
+}
+
+function podKey(pod) {
+  return `${pod.namespace}/${pod.name}`;
+}
+
+function nodeLabelLines(name) {
+  if (name.length <= 18) return [name];
+  const parts = name.split("-");
+  if (parts.length < 4) return [name];
+  const splitIndex = /^\d+$/.test(parts[parts.length - 1]) ? parts.length - 2 : parts.length - 1;
+  return [parts.slice(0, splitIndex).join("-"), parts.slice(splitIndex).join("-")];
+}
+
+function colorFor(value) {
+  let hash = 0;
+  for (const char of value || "default") hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  return groupColors[hash % groupColors.length];
+}
+
+function podColor(pod) {
+  if (selectedGroup !== "all") {
+    return pod.app ? colorFor(`app:${pod.app}`) : unlabeledColor();
+  }
+  return pod.group ? colorFor(`group:${pod.group}`) : unlabeledColor();
+}
+
+function unlabeledColor() {
+  return "#98a2b3";
+}
+
+function uniqueSorted(values) {
+  return [...new Set(values)].sort((a, b) => a.localeCompare(b));
+}
+
+function clamp(value, min, max) {
+  if (min > max) return (min + max) / 2;
+  return Math.max(min, Math.min(max, value));
+}
+
+function midpoint(a, b) {
+  return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+}
+
+function curvedPath(a, b, curve) {
+  const mid = midpoint(a, b);
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len = Math.max(1, Math.hypot(dx, dy));
+  const cx = mid.x - (dy / len) * curve;
+  const cy = mid.y + (dx / len) * curve;
+  return `M ${a.x} ${a.y} Q ${cx} ${cy} ${b.x} ${b.y}`;
+}
+
+function curvePoint(a, b, curve) {
+  const mid = midpoint(a, b);
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len = Math.max(1, Math.hypot(dx, dy));
+  return {
+    x: mid.x - (dy / len) * curve * 0.5,
+    y: mid.y + (dx / len) * curve * 0.5,
+  };
+}
+
+function svg(name, attrs) {
+  const el = document.createElementNS("http://www.w3.org/2000/svg", name);
+  for (const [key, value] of Object.entries(attrs || {})) {
+    el.setAttribute(key, value);
+  }
+  return el;
+}
+
+function svgText(x, y, text, className, anchor = "middle") {
+  const el = svg("text", { x, y, class: className, "text-anchor": anchor });
+  el.textContent = text;
+  return el;
+}
+
+function clear(el) {
+  while (el.firstChild) el.removeChild(el.firstChild);
+}
+
+function pill(text) {
+  return `<span class="pill">${escapeHTML(text)}</span>`;
+}
+
+function formatMillicores(value) {
+  return Number.isFinite(value) && value > 0 ? `${value.toFixed(1)} mCPU` : "n/a";
+}
+
+function formatBytes(value) {
+  if (!Number.isFinite(value) || value <= 0) return "n/a";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let next = value;
+  let index = 0;
+  while (next >= 1024 && index < units.length - 1) {
+    next /= 1024;
+    index += 1;
+  }
+  return `${next.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function formatRate(value) {
+  return Number.isFinite(value) && value > 0 ? `${formatBytes(value)}/s` : "n/a";
+}
+
+function formatLatency(value) {
+  return Number.isFinite(value) ? `${value.toFixed(3)} ms` : "n/a";
+}
+
+function escapeHTML(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
