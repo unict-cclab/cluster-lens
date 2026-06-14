@@ -1,0 +1,26 @@
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local environment
+.env
+.env.*
+
+# Go build and test artifacts
+bin/
+build/
+dist/
+*.test
+coverage.out
+coverage.html
+
+# Logs and runtime output
+*.log
+tmp/
+
+# Frontend dependencies and build artifacts
+node_modules/
+frontend/dist/
+frontend/build/
