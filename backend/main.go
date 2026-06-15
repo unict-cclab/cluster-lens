@@ -3,24 +3,28 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 const (
 	defaultAddr      = "127.0.0.1:8088"
 	defaultRefresh   = 2 * time.Second
 	defaultStaticDir = "../frontend"
-	kubectlTimeout   = 10 * time.Second
 )
 
 type snapshot struct {
@@ -67,58 +71,11 @@ type edgeView struct {
 	Label  string  `json:"label,omitempty"`
 }
 
-type kubeList[T any] struct {
-	Items []T `json:"items"`
-}
-
-type kubeObjectMeta struct {
-	Name              string            `json:"name"`
-	Namespace         string            `json:"namespace"`
-	Labels            map[string]string `json:"labels"`
-	Annotations       map[string]string `json:"annotations"`
-	CreationTimestamp string            `json:"creationTimestamp"`
-	OwnerReferences   []ownerReference  `json:"ownerReferences"`
-}
-
-type ownerReference struct {
-	Kind string `json:"kind"`
-	Name string `json:"name"`
-}
-
-type kubeNode struct {
-	Metadata kubeObjectMeta `json:"metadata"`
-	Status   struct {
-		Conditions []struct {
-			Type   string `json:"type"`
-			Status string `json:"status"`
-		} `json:"conditions"`
-	} `json:"status"`
-}
-
-type kubePod struct {
-	Metadata kubeObjectMeta `json:"metadata"`
-	Spec     struct {
-		NodeName   string `json:"nodeName"`
-		Containers []struct {
-			Name string `json:"name"`
-		} `json:"containers"`
-	} `json:"spec"`
-	Status struct {
-		Phase string `json:"phase"`
-	} `json:"status"`
-}
-
-type kubeDeployment struct {
-	Metadata kubeObjectMeta `json:"metadata"`
-}
-
-type kubeReplicaSet struct {
-	Metadata kubeObjectMeta `json:"metadata"`
-}
-
 type server struct {
 	staticDir string
 	refresh   time.Duration
+	kube      kubernetes.Interface
+	context   string
 }
 
 func main() {
@@ -133,7 +90,12 @@ func main() {
 		refresh = parsed
 	}
 
-	s := &server{staticDir: staticDir, refresh: refresh}
+	kube, contextName, err := newKubeClient()
+	if err != nil {
+		log.Fatalf("kubernetes client: %v", err)
+	}
+
+	s := &server{staticDir: staticDir, refresh: refresh, kube: kube, context: contextName}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/snapshot", s.snapshot)
 	mux.HandleFunc("/api/config", s.config)
@@ -154,7 +116,7 @@ func (s *server) config(w http.ResponseWriter, _ *http.Request) {
 
 func (s *server) snapshot(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	snap, err := buildSnapshot(ctx)
+	snap, err := s.buildSnapshot(ctx)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -162,40 +124,37 @@ func (s *server) snapshot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, snap)
 }
 
-func buildSnapshot(ctx context.Context) (snapshot, error) {
+func (s *server) buildSnapshot(ctx context.Context) (snapshot, error) {
 	var warnings []string
 
-	contextName, err := kubectlText(ctx, "config", "current-context")
+	nodes, err := s.kube.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return snapshot{}, err
+		return snapshot{}, fmt.Errorf("list nodes: %w", err)
+	}
+	pods, err := s.kube.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return snapshot{}, fmt.Errorf("list pods: %w", err)
+	}
+	deployments, err := s.kube.AppsV1().Deployments("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		warnings = append(warnings, fmt.Sprintf("list deployments: %v", err))
+		deployments = &appsv1.DeploymentList{}
+	}
+	replicaSets, err := s.kube.AppsV1().ReplicaSets("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		warnings = append(warnings, fmt.Sprintf("list replicasets: %v", err))
+		replicaSets = &appsv1.ReplicaSetList{}
 	}
 
-	nodes, err := kubectlJSON[kubeList[kubeNode]](ctx, "get", "nodes", "-o", "json")
-	if err != nil {
-		return snapshot{}, err
-	}
-	pods, err := kubectlJSON[kubeList[kubePod]](ctx, "get", "pods", "-A", "-o", "json")
-	if err != nil {
-		return snapshot{}, err
-	}
-	deployments, err := kubectlJSON[kubeList[kubeDeployment]](ctx, "get", "deployments", "-A", "-o", "json")
-	if err != nil {
-		warnings = append(warnings, err.Error())
-	}
-	replicaSets, err := kubectlJSON[kubeList[kubeReplicaSet]](ctx, "get", "replicasets", "-A", "-o", "json")
-	if err != nil {
-		warnings = append(warnings, err.Error())
-	}
-
-	deploymentByKey := map[string]kubeDeployment{}
+	deploymentByKey := map[string]appsv1.Deployment{}
 	for _, deployment := range deployments.Items {
-		deploymentByKey[key(deployment.Metadata.Namespace, deployment.Metadata.Name)] = deployment
+		deploymentByKey[key(deployment.Namespace, deployment.Name)] = deployment
 	}
 	rsOwner := map[string]string{}
 	for _, rs := range replicaSets.Items {
-		for _, owner := range rs.Metadata.OwnerReferences {
+		for _, owner := range rs.OwnerReferences {
 			if owner.Kind == "Deployment" {
-				rsOwner[key(rs.Metadata.Namespace, rs.Metadata.Name)] = owner.Name
+				rsOwner[key(rs.Namespace, rs.Name)] = owner.Name
 				break
 			}
 		}
@@ -203,7 +162,7 @@ func buildSnapshot(ctx context.Context) (snapshot, error) {
 
 	snap := snapshot{
 		GeneratedAt: time.Now(),
-		Context:     strings.TrimSpace(contextName),
+		Context:     s.context,
 		Nodes:       make([]nodeView, 0, len(nodes.Items)),
 		NodeEdges:   make([]edgeView, 0),
 		Pods:        make([]podView, 0, len(pods.Items)),
@@ -212,13 +171,13 @@ func buildSnapshot(ctx context.Context) (snapshot, error) {
 	}
 
 	for _, node := range nodes.Items {
-		annotations := node.Metadata.Annotations
+		annotations := node.Annotations
 		view := nodeView{
-			Name:        node.Metadata.Name,
-			Labels:      node.Metadata.Labels,
+			Name:        node.Name,
+			Labels:      node.Labels,
 			Annotations: selectedAnnotations(annotations, "cpu-usage", "memory-usage", "disk-bandwidth", "network-bandwidth"),
 			Ready:       nodeReady(node),
-			Role:        nodeRole(node.Metadata.Labels),
+			Role:        nodeRole(node.Labels),
 			CPU:         parseFloat(annotations["cpu-usage"]),
 			Memory:      parseFloat(annotations["memory-usage"]),
 			Disk:        parseFloat(annotations["disk-bandwidth"]),
@@ -230,12 +189,12 @@ func buildSnapshot(ctx context.Context) (snapshot, error) {
 				continue
 			}
 			target := strings.TrimPrefix(annotation, "network-latency.")
-			if target == "" || target == node.Metadata.Name {
+			if target == "" || target == node.Name {
 				continue
 			}
 			latency := parseFloat(raw)
 			snap.NodeEdges = append(snap.NodeEdges, edgeView{
-				Source: node.Metadata.Name,
+				Source: node.Name,
 				Target: target,
 				Kind:   "latency",
 				Value:  latency,
@@ -251,8 +210,8 @@ func buildSnapshot(ctx context.Context) (snapshot, error) {
 		owner := podOwnerDeployment(pod, rsOwner)
 		metrics := map[string]string{}
 		if owner != "" {
-			if deployment, ok := deploymentByKey[key(pod.Metadata.Namespace, owner)]; ok {
-				metrics = selectedMetricAnnotations(deployment.Metadata.Annotations)
+			if deployment, ok := deploymentByKey[key(pod.Namespace, owner)]; ok {
+				metrics = selectedMetricAnnotations(deployment.Annotations)
 				appendAppEdges(&snap, deployment)
 			}
 		}
@@ -262,18 +221,18 @@ func buildSnapshot(ctx context.Context) (snapshot, error) {
 		}
 		sort.Strings(containers)
 
-		labels := pod.Metadata.Labels
+		labels := pod.Labels
 		snap.Pods = append(snap.Pods, podView{
-			Namespace:  pod.Metadata.Namespace,
-			Name:       pod.Metadata.Name,
+			Namespace:  pod.Namespace,
+			Name:       pod.Name,
 			Node:       pod.Spec.NodeName,
-			Phase:      pod.Status.Phase,
+			Phase:      string(pod.Status.Phase),
 			Group:      labels["group"],
 			App:        labelOr(labels, "app", owner),
 			Owner:      owner,
 			Labels:     labels,
 			Metrics:    metrics,
-			CreatedAt:  pod.Metadata.CreationTimestamp,
+			CreatedAt:  pod.CreationTimestamp.Format(time.RFC3339),
 			Containers: containers,
 		})
 	}
@@ -293,16 +252,16 @@ func buildSnapshot(ctx context.Context) (snapshot, error) {
 	return snap, nil
 }
 
-func appendAppEdges(snap *snapshot, deployment kubeDeployment) {
-	app := labelOr(deployment.Metadata.Labels, "app", deployment.Metadata.Name)
-	source := key(deployment.Metadata.Namespace, app)
-	for annotation, raw := range deployment.Metadata.Annotations {
+func appendAppEdges(snap *snapshot, deployment appsv1.Deployment) {
+	app := labelOr(deployment.Labels, "app", deployment.Name)
+	source := key(deployment.Namespace, app)
+	for annotation, raw := range deployment.Annotations {
 		if strings.HasPrefix(annotation, "rps.") {
 			peer := strings.TrimPrefix(annotation, "rps.")
 			value := parseFloat(raw)
 			snap.AppEdges = append(snap.AppEdges, edgeView{
 				Source: source,
-				Target: key(deployment.Metadata.Namespace, peer),
+				Target: key(deployment.Namespace, peer),
 				Kind:   "rps",
 				Value:  value,
 				Label:  formatFloat(value) + " rps",
@@ -313,7 +272,7 @@ func appendAppEdges(snap *snapshot, deployment kubeDeployment) {
 			value := parseFloat(raw)
 			snap.AppEdges = append(snap.AppEdges, edgeView{
 				Source: source,
-				Target: key(deployment.Metadata.Namespace, peer),
+				Target: key(deployment.Namespace, peer),
 				Kind:   "traffic",
 				Value:  value,
 				Label:  formatBytes(value) + "/s",
@@ -322,13 +281,13 @@ func appendAppEdges(snap *snapshot, deployment kubeDeployment) {
 	}
 }
 
-func podOwnerDeployment(pod kubePod, rsOwner map[string]string) string {
-	for _, owner := range pod.Metadata.OwnerReferences {
+func podOwnerDeployment(pod corev1.Pod, rsOwner map[string]string) string {
+	for _, owner := range pod.OwnerReferences {
 		switch owner.Kind {
 		case "Deployment":
 			return owner.Name
 		case "ReplicaSet":
-			if deployment := rsOwner[key(pod.Metadata.Namespace, owner.Name)]; deployment != "" {
+			if deployment := rsOwner[key(pod.Namespace, owner.Name)]; deployment != "" {
 				return deployment
 			}
 			return owner.Name
@@ -337,10 +296,10 @@ func podOwnerDeployment(pod kubePod, rsOwner map[string]string) string {
 	return ""
 }
 
-func nodeReady(node kubeNode) bool {
+func nodeReady(node corev1.Node) bool {
 	for _, condition := range node.Status.Conditions {
-		if condition.Type == "Ready" {
-			return condition.Status == "True"
+		if condition.Type == corev1.NodeReady {
+			return condition.Status == corev1.ConditionTrue
 		}
 	}
 	return false
@@ -406,36 +365,38 @@ func dedupeEdges(edges []edgeView) []edgeView {
 	return out
 }
 
-func kubectlJSON[T any](ctx context.Context, args ...string) (T, error) {
-	var out T
-	text, err := kubectlText(ctx, args...)
-	if err != nil {
-		return out, err
-	}
-	if err := json.Unmarshal([]byte(text), &out); err != nil {
-		return out, fmt.Errorf("decode kubectl %s: %w", strings.Join(args, " "), err)
-	}
-	return out, nil
-}
-
-func kubectlText(ctx context.Context, args ...string) (string, error) {
-	kctx, cancel := context.WithTimeout(ctx, kubectlTimeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(kctx, "kubectl", args...)
-	output, err := cmd.CombinedOutput()
-	if errors.Is(kctx.Err(), context.DeadlineExceeded) {
-		return "", fmt.Errorf("kubectl %s timed out", strings.Join(args, " "))
-	}
-	if err != nil {
-		return "", fmt.Errorf("kubectl %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
-	}
-	return string(output), nil
-}
-
 func writeJSON(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func newKubeClient() (kubernetes.Interface, string, error) {
+	cfg, err := rest.InClusterConfig()
+	if err == nil {
+		kube, err := kubernetes.NewForConfig(cfg)
+		return kube, envOr("CLUSTER_LENS_CONTEXT", "in-cluster"), err
+	}
+
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	if kubeconfig := strings.TrimSpace(os.Getenv("KUBECONFIG")); kubeconfig != "" {
+		loadingRules.ExplicitPath = kubeconfig
+	}
+	overrides := &clientcmd.ConfigOverrides{}
+	clientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, overrides)
+	cfg, err = clientConfig.ClientConfig()
+	if err != nil {
+		return nil, "", err
+	}
+	rawConfig, err := clientConfig.RawConfig()
+	if err != nil {
+		return nil, "", err
+	}
+	contextName := envOr("CLUSTER_LENS_CONTEXT", rawConfig.CurrentContext)
+	if contextName == "" {
+		contextName = "kubeconfig"
+	}
+	kube, err := kubernetes.NewForConfig(cfg)
+	return kube, contextName, err
 }
 
 func envOr(name, fallback string) string {

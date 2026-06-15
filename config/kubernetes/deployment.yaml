@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cluster-lens
+  namespace: observability
+  labels:
+    app: cluster-lens
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cluster-lens
+  template:
+    metadata:
+      labels:
+        app: cluster-lens
+    spec:
+      serviceAccountName: cluster-lens
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: nodepool
+                    operator: In
+                    values:
+                      - management
+      tolerations:
+        - key: "ManagementOnly"
+          operator: "Equal"
+          value: "true"
+          effect: "NoSchedule"
+      containers:
+        - name: cluster-lens
+          image: ghcr.io/unict-cclab/cluster-lens:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8088
+          env:
+            - name: CLUSTER_LENS_ADDR
+              value: :8088
+            - name: CLUSTER_LENS_REFRESH
+              value: 2s
+            - name: CLUSTER_LENS_CONTEXT
+              value: in-cluster
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cluster-lens
+  namespace: observability
+  labels:
+    app: cluster-lens
+spec:
+  type: ClusterIP
+  selector:
+    app: cluster-lens
+  ports:
+    - name: http
+      port: 8088
+      targetPort: http
