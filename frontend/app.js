@@ -26,6 +26,7 @@ const groupColors = [
 
 const nodeRadius = 92;
 const nodePadding = nodeRadius + 44;
+const panSlackRatio = 0.42;
 
 let refreshMs = 2000;
 let latestSnapshot = null;
@@ -35,6 +36,7 @@ let selectedGroup = "all";
 let zoom = 1;
 let viewCenter = null;
 let panState = null;
+let suppressGraphClick = false;
 let nodeDragState = null;
 let nodePositionOverrides = new Map();
 let nodePositionContext = "";
@@ -61,6 +63,7 @@ async function init() {
   zoomResetButton.addEventListener("click", () => changeZoom(1));
   zoomInButton.addEventListener("click", () => changeZoom(zoom * 1.25));
   graph.addEventListener("wheel", handleWheelZoom, { passive: false });
+  graph.addEventListener("click", suppressClickAfterPan, true);
   graph.addEventListener("pointerdown", startPan);
   graph.addEventListener("pointermove", movePan);
   graph.addEventListener("pointerup", endPan);
@@ -192,6 +195,7 @@ function drawNodeEdges(edges, nodePositions) {
       d: curvedPath(source, target, 0),
       class: "latency-edge edge-hit",
     });
+    path.addEventListener("pointerdown", stopGraphPan);
     path.addEventListener("click", () => inspect("Latency", edge));
     graph.append(path);
 
@@ -209,6 +213,7 @@ function drawAppEdges(edges, appPositions) {
       d: curvedPath(source, target, 34),
       class: "app-edge edge-hit",
     });
+    path.addEventListener("pointerdown", stopGraphPan);
     path.addEventListener("click", () => inspect("App Link", edge));
     graph.append(path);
   }
@@ -244,7 +249,9 @@ function drawPods(pods, podPositions) {
     const pos = podPositions.get(podKey(pod));
     if (!pos) continue;
     const group = svg("g");
-    group.addEventListener("click", () => inspect("Pod", pod));
+    group.addEventListener("pointerdown", startPodSelect);
+    group.addEventListener("pointerup", (event) => endPodSelect(event, pod));
+    group.addEventListener("pointercancel", endPodSelect);
     group.append(svg("circle", {
       cx: pos.x,
       cy: pos.y,
@@ -358,11 +365,11 @@ function handleWheelZoom(event) {
 function startPan(event) {
   if (event.button !== 0) return;
   if (nodeDragState) return;
-  if (event.target !== graph) return;
   panState = {
     pointerId: event.pointerId,
     x: event.clientX,
     y: event.clientY,
+    moved: false,
   };
   graph.setPointerCapture(event.pointerId);
   graph.classList.add("is-panning");
@@ -374,14 +381,44 @@ function movePan(event) {
   const dy = event.clientY - panState.y;
   panState.x = event.clientX;
   panState.y = event.clientY;
+  if (Math.hypot(dx, dy) > 2) panState.moved = true;
   panBy(dx, dy);
 }
 
 function endPan(event) {
   if (!panState || panState.pointerId !== event.pointerId) return;
+  suppressGraphClick = panState.moved;
   graph.releasePointerCapture(event.pointerId);
   graph.classList.remove("is-panning");
   panState = null;
+  if (suppressGraphClick) window.setTimeout(() => {
+    suppressGraphClick = false;
+  }, 0);
+}
+
+function suppressClickAfterPan(event) {
+  if (!suppressGraphClick) return;
+  event.preventDefault();
+  event.stopPropagation();
+  suppressGraphClick = false;
+}
+
+function stopGraphPan(event) {
+  event.stopPropagation();
+}
+
+function startPodSelect(event) {
+  if (event.button !== 0) return;
+  event.stopPropagation();
+  event.currentTarget.setPointerCapture(event.pointerId);
+}
+
+function endPodSelect(event, pod = null) {
+  event.stopPropagation();
+  if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+    event.currentTarget.releasePointerCapture(event.pointerId);
+  }
+  if (pod) inspect("Pod", pod);
 }
 
 function panBy(dx, dy) {
@@ -519,9 +556,11 @@ function currentViewCenter(width, height) {
   if (!viewCenter) return fallback;
   const viewWidth = width / zoom;
   const viewHeight = height / zoom;
+  const slackX = viewWidth * panSlackRatio;
+  const slackY = viewHeight * panSlackRatio;
   return {
-    x: clamp(viewCenter.x, viewWidth / 2, width - viewWidth / 2),
-    y: clamp(viewCenter.y, viewHeight / 2, height - viewHeight / 2),
+    x: clamp(viewCenter.x, viewWidth / 2 - slackX, width - viewWidth / 2 + slackX),
+    y: clamp(viewCenter.y, viewHeight / 2 - slackY, height - viewHeight / 2 + slackY),
   };
 }
 
@@ -580,14 +619,82 @@ function legendItem(label, color) {
 }
 
 function detailRows(value) {
-  return Object.entries(flatten(value))
+  const flat = flatten(value);
+  return Object.entries(flat)
     .map(([key, val]) => `
       <div class="detail-row">
-        <strong>${escapeHTML(key)}</strong>
-        <code>${escapeHTML(String(val))}</code>
+        <strong>${escapeHTML(formatDetailKey(key, flat))}</strong>
+        <code>${escapeHTML(formatDetailValue(key, val, flat))}</code>
       </div>
     `)
     .join("");
+}
+
+function formatDetailKey(key, row) {
+  const metric = metricName(key);
+  const unit = detailUnit(key, metric, row);
+  return unit ? `${key} (${unit})` : key;
+}
+
+function formatDetailValue(key, value, row) {
+  const metric = metricName(key);
+  const numeric = Number(value);
+  const isNumeric = value !== "" && Number.isFinite(numeric);
+
+  if (metric === "cpu-usage" || key === "cpu") {
+    return isNumeric ? formatMillicores(numeric) : String(value);
+  }
+  if (metric === "memory-usage" || key === "memory") {
+    return isNumeric ? formatBytes(numeric) : String(value);
+  }
+  if (metric === "disk-bandwidth" || key === "disk") {
+    return isNumeric ? formatRate(numeric) : String(value);
+  }
+  if (metric === "network-bandwidth" || key === "network") {
+    return isNumeric ? formatRate(numeric) : String(value);
+  }
+  if (metric?.startsWith("network-latency.") || (key === "value" && row.kind === "latency")) {
+    return isNumeric ? formatLatency(numeric) : String(value);
+  }
+  if (metric?.startsWith("rps.") || (key === "value" && row.kind === "rps")) {
+    return isNumeric ? formatRPS(numeric) : String(value);
+  }
+  if (metric?.startsWith("traffic.") || (key === "value" && row.kind === "traffic")) {
+    return isNumeric ? formatRate(numeric) : String(value);
+  }
+  if (key === "samples" && isNumeric) {
+    return `${numeric} samples`;
+  }
+  return String(value);
+}
+
+function detailUnit(key, metric, row) {
+  if (metric === "cpu-usage" || key === "cpu") return "mCPU";
+  if (metric === "memory-usage" || key === "memory") return "bytes";
+  if (metric === "disk-bandwidth" || key === "disk") return "B/s";
+  if (metric === "network-bandwidth" || key === "network") return "B/s";
+  if (metric?.startsWith("network-latency.") || (key === "value" && row.kind === "latency")) return "ms";
+  if (metric?.startsWith("rps.") || (key === "value" && row.kind === "rps")) return "rps";
+  if (metric?.startsWith("traffic.") || (key === "value" && row.kind === "traffic")) return "B/s";
+  if (key === "samples") return "count";
+  return "";
+}
+
+function metricName(key) {
+  if (key.startsWith("metrics.")) return key.slice("metrics.".length);
+  if (key.startsWith("annotations.")) return key.slice("annotations.".length);
+  const knownNames = [
+    "cpu-usage",
+    "memory-usage",
+    "disk-bandwidth",
+    "network-bandwidth",
+    "network-latency.",
+    "rps.",
+    "traffic.",
+  ];
+  const match = knownNames.find((name) => key.includes(name));
+  if (!match) return null;
+  return key.slice(key.indexOf(match));
 }
 
 function flatten(value, prefix = "", out = {}) {
@@ -705,11 +812,11 @@ function pill(text) {
 }
 
 function formatMillicores(value) {
-  return Number.isFinite(value) && value > 0 ? `${value.toFixed(1)} mCPU` : "n/a";
+  return Number.isFinite(value) && value >= 0 ? `${value.toFixed(1)} mCPU` : "n/a";
 }
 
 function formatBytes(value) {
-  if (!Number.isFinite(value) || value <= 0) return "n/a";
+  if (!Number.isFinite(value) || value < 0) return "n/a";
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let next = value;
   let index = 0;
@@ -721,11 +828,15 @@ function formatBytes(value) {
 }
 
 function formatRate(value) {
-  return Number.isFinite(value) && value > 0 ? `${formatBytes(value)}/s` : "n/a";
+  return Number.isFinite(value) && value >= 0 ? `${formatBytes(value)}/s` : "n/a";
 }
 
 function formatLatency(value) {
   return Number.isFinite(value) ? `${value.toFixed(3)} ms` : "n/a";
+}
+
+function formatRPS(value) {
+  return Number.isFinite(value) ? `${value.toFixed(2)} rps` : "n/a";
 }
 
 function escapeHTML(value) {
