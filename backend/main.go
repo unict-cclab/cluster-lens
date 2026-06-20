@@ -64,11 +64,13 @@ type podView struct {
 }
 
 type edgeView struct {
-	Source string  `json:"source"`
-	Target string  `json:"target"`
-	Kind   string  `json:"kind"`
-	Value  float64 `json:"value,omitempty"`
-	Label  string  `json:"label,omitempty"`
+	Source     string   `json:"source"`
+	Target     string   `json:"target"`
+	Kind       string   `json:"kind"`
+	Value      float64  `json:"value,omitempty"`
+	Bandwidth  *float64 `json:"bandwidth,omitempty"`
+	PacketLoss *float64 `json:"packetLoss,omitempty"`
+	Label      string   `json:"label,omitempty"`
 }
 
 type server struct {
@@ -175,32 +177,16 @@ func (s *server) buildSnapshot(ctx context.Context) (snapshot, error) {
 		view := nodeView{
 			Name:        node.Name,
 			Labels:      node.Labels,
-			Annotations: selectedAnnotations(annotations, "cpu-usage", "memory-usage", "disk-bandwidth", "network-bandwidth"),
+			Annotations: selectedNodeAnnotations(annotations),
 			Ready:       nodeReady(node),
 			Role:        nodeRole(node.Labels),
 			CPU:         parseFloat(annotations["cpu-usage"]),
 			Memory:      parseFloat(annotations["memory-usage"]),
-			Disk:        parseFloat(annotations["disk-bandwidth"]),
-			Network:     parseFloat(annotations["network-bandwidth"]),
+			Disk:        parseFloat(annotationValue(annotations, "disk-throughput", "disk-bandwidth")),
+			Network:     parseFloat(annotationValue(annotations, "network-throughput", "network-bandwidth")),
 		}
 		snap.Nodes = append(snap.Nodes, view)
-		for annotation, raw := range annotations {
-			if !strings.HasPrefix(annotation, "network-latency.") {
-				continue
-			}
-			target := strings.TrimPrefix(annotation, "network-latency.")
-			if target == "" || target == node.Name {
-				continue
-			}
-			latency := parseFloat(raw)
-			snap.NodeEdges = append(snap.NodeEdges, edgeView{
-				Source: node.Name,
-				Target: target,
-				Kind:   "latency",
-				Value:  latency,
-				Label:  formatMS(latency),
-			})
-		}
+		appendNodeEdges(&snap, node.Name, annotations)
 	}
 
 	for _, pod := range pods.Items {
@@ -328,10 +314,106 @@ func selectedAnnotations(annotations map[string]string, names ...string) map[str
 	return out
 }
 
-func selectedMetricAnnotations(annotations map[string]string) map[string]string {
-	out := selectedAnnotations(annotations, "cpu-usage", "memory-usage", "disk-bandwidth", "network-bandwidth")
+func appendNodeEdges(snap *snapshot, source string, annotations map[string]string) {
+	edges := map[string]*edgeView{}
+	for annotation, raw := range annotations {
+		prefix := ""
+		kind := ""
+		switch {
+		case strings.HasPrefix(annotation, "network-latency."):
+			prefix = "network-latency."
+			kind = "latency"
+		case strings.HasPrefix(annotation, "network-bandwidth."):
+			prefix = "network-bandwidth."
+			kind = "bandwidth"
+		case strings.HasPrefix(annotation, "packet-loss."):
+			prefix = "packet-loss."
+			kind = "packet-loss"
+		default:
+			continue
+		}
+
+		target := strings.TrimPrefix(annotation, prefix)
+		if target == "" || target == source {
+			continue
+		}
+		edge := edges[target]
+		if edge == nil {
+			edge = &edgeView{Source: source, Target: target, Kind: "network"}
+			edges[target] = edge
+		}
+		value := parseFloat(raw)
+		switch kind {
+		case "latency":
+			edge.Value = value
+			edge.Label = formatMS(value)
+		case "bandwidth":
+			edge.Bandwidth = floatPointer(value)
+		case "packet-loss":
+			edge.PacketLoss = floatPointer(value)
+		}
+	}
+
+	for _, edge := range edges {
+		snap.NodeEdges = append(snap.NodeEdges, *edge)
+	}
+}
+
+func floatPointer(value float64) *float64 {
+	return &value
+}
+
+func annotationValue(annotations map[string]string, name, legacyName string) string {
+	if value := annotations[name]; value != "" {
+		return value
+	}
+	return annotations[legacyName]
+}
+
+func selectedNodeAnnotations(annotations map[string]string) map[string]string {
+	out := selectedAnnotations(annotations, "cpu-usage", "memory-usage")
 	if out == nil {
 		out = map[string]string{}
+	}
+	for _, metric := range []struct {
+		name   string
+		legacy string
+	}{
+		{name: "disk-throughput", legacy: "disk-bandwidth"},
+		{name: "network-throughput", legacy: "network-bandwidth"},
+	} {
+		if value := annotationValue(annotations, metric.name, metric.legacy); value != "" {
+			out[metric.name] = value
+		}
+	}
+	for name, value := range annotations {
+		if strings.HasPrefix(name, "network-latency.") ||
+			strings.HasPrefix(name, "network-bandwidth.") ||
+			strings.HasPrefix(name, "packet-loss.") {
+			out[name] = value
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func selectedMetricAnnotations(annotations map[string]string) map[string]string {
+	out := selectedAnnotations(annotations, "cpu-usage", "memory-usage")
+	if out == nil {
+		out = map[string]string{}
+	}
+	for _, metric := range []struct {
+		name   string
+		legacy string
+	}{
+		{name: "disk-throughput", legacy: "disk-bandwidth"},
+		{name: "network-throughput", legacy: "network-bandwidth"},
+	} {
+		if value := annotationValue(annotations, metric.name, metric.legacy); value != "" {
+			out[metric.name] = value
+		}
 	}
 	for name, value := range annotations {
 		if strings.HasPrefix(name, "rps.") || strings.HasPrefix(name, "traffic.") {

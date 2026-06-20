@@ -6,11 +6,13 @@ pod placement.
 It shows:
 
 - cluster nodes with metrics from node annotations
-- node-to-node latency from `network-latency.<node>` annotations
+- node-to-node latency, available bandwidth, and packet loss from
+  `network-latency.<node>`, `network-bandwidth.<node>`, and
+  `packet-loss.<node>` annotations
 - pods placed on their current nodes
 - pod colors based on the `group` label
 - app/deployment metrics from annotations such as `cpu-usage`, `memory-usage`,
-  `disk-bandwidth`, `network-bandwidth`, `rps.<peer>`, and `traffic.<peer>`
+  `disk-throughput`, `network-throughput`, `rps.<peer>`, and `traffic.<peer>`
 
 The backend uses the Kubernetes API directly and serves a static frontend. It
 uses in-cluster credentials when deployed on Kubernetes, then falls back to the

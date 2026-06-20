@@ -122,7 +122,7 @@ function render(snapshot) {
   statsEl.innerHTML = [
     pill(`${snapshot.nodes.length} nodes`),
     pill(`${visiblePods.length} pods`),
-    pill(`${averagedNodeEdges.length} latency links`),
+    pill(`${averagedNodeEdges.length} network links`),
     pill(`${countGroups(visiblePods)} groups`),
   ].join("");
   renderLegend(visiblePods);
@@ -196,7 +196,7 @@ function drawNodeEdges(edges, nodePositions) {
       class: "latency-edge edge-hit",
     });
     path.addEventListener("pointerdown", stopGraphPan);
-    path.addEventListener("click", () => inspect("Latency", edge));
+    path.addEventListener("click", () => inspect("Network Link", edge));
     graph.append(path);
 
     const label = curvePoint(source, target, 0);
@@ -316,25 +316,43 @@ function averageNodeEdges(edges) {
       pairs.set(key, {
         source: names[0],
         target: names[1],
-        kind: "latency",
+        kind: "network",
         values: [],
+        bandwidthValues: [],
+        packetLossValues: [],
       });
     }
     const pair = pairs.get(key);
     if (Number.isFinite(edge.value)) pair.values.push(edge.value);
+    if (Number.isFinite(edge.bandwidth)) pair.bandwidthValues.push(edge.bandwidth);
+    if (Number.isFinite(edge.packetLoss)) pair.packetLossValues.push(edge.packetLoss);
   }
 
   return [...pairs.values()].map((pair) => {
-    const value = pair.values.reduce((sum, next) => sum + next, 0) / Math.max(1, pair.values.length);
+    const value = average(pair.values);
+    const bandwidth = average(pair.bandwidthValues);
+    const packetLoss = average(pair.packetLossValues);
+    const label = [
+      Number.isFinite(value) ? formatLatency(value) : "",
+      Number.isFinite(bandwidth) ? formatRate(bandwidth) : "",
+      Number.isFinite(packetLoss) ? formatPacketLoss(packetLoss) : "",
+    ].filter(Boolean).join(" · ");
     return {
       source: pair.source,
       target: pair.target,
       kind: pair.kind,
       value,
-      samples: pair.values.length,
-      label: formatLatency(value),
+      bandwidth,
+      packetLoss,
+      samples: Math.max(pair.values.length, pair.bandwidthValues.length, pair.packetLossValues.length),
+      label,
     };
   });
+}
+
+function average(values) {
+  if (values.length === 0) return null;
+  return values.reduce((sum, next) => sum + next, 0) / values.length;
 }
 
 function changeZoom(nextZoom, focus = null) {
@@ -639,7 +657,7 @@ function formatDetailKey(key, row) {
 function formatDetailValue(key, value, row) {
   const metric = metricName(key);
   const numeric = Number(value);
-  const isNumeric = value !== "" && Number.isFinite(numeric);
+  const isNumeric = value !== "" && value !== null && value !== undefined && Number.isFinite(numeric);
 
   if (metric === "cpu-usage" || key === "cpu") {
     return isNumeric ? formatMillicores(numeric) : String(value);
@@ -647,13 +665,19 @@ function formatDetailValue(key, value, row) {
   if (metric === "memory-usage" || key === "memory") {
     return isNumeric ? formatBytes(numeric) : String(value);
   }
-  if (metric === "disk-bandwidth" || key === "disk") {
+  if (metric === "disk-throughput" || metric === "disk-bandwidth" || key === "disk") {
     return isNumeric ? formatRate(numeric) : String(value);
   }
-  if (metric === "network-bandwidth" || key === "network") {
+  if (metric === "network-throughput" || metric === "network-bandwidth" || key === "network") {
     return isNumeric ? formatRate(numeric) : String(value);
   }
-  if (metric?.startsWith("network-latency.") || (key === "value" && row.kind === "latency")) {
+  if (metric?.startsWith("network-bandwidth.") || key === "bandwidth") {
+    return isNumeric ? formatRate(numeric) : String(value);
+  }
+  if (metric?.startsWith("packet-loss.") || key === "packetLoss") {
+    return isNumeric ? formatPacketLoss(numeric) : String(value);
+  }
+  if (metric?.startsWith("network-latency.") || (key === "value" && (row.kind === "latency" || row.kind === "network"))) {
     return isNumeric ? formatLatency(numeric) : String(value);
   }
   if (metric?.startsWith("rps.") || (key === "value" && row.kind === "rps")) {
@@ -671,9 +695,11 @@ function formatDetailValue(key, value, row) {
 function detailUnit(key, metric, row) {
   if (metric === "cpu-usage" || key === "cpu") return "mCPU";
   if (metric === "memory-usage" || key === "memory") return "bytes";
-  if (metric === "disk-bandwidth" || key === "disk") return "B/s";
-  if (metric === "network-bandwidth" || key === "network") return "B/s";
-  if (metric?.startsWith("network-latency.") || (key === "value" && row.kind === "latency")) return "ms";
+  if (metric === "disk-throughput" || metric === "disk-bandwidth" || key === "disk") return "B/s";
+  if (metric === "network-throughput" || metric === "network-bandwidth" || key === "network") return "B/s";
+  if (metric?.startsWith("network-bandwidth.") || key === "bandwidth") return "B/s";
+  if (metric?.startsWith("packet-loss.") || key === "packetLoss") return "%";
+  if (metric?.startsWith("network-latency.") || (key === "value" && (row.kind === "latency" || row.kind === "network"))) return "ms";
   if (metric?.startsWith("rps.") || (key === "value" && row.kind === "rps")) return "rps";
   if (metric?.startsWith("traffic.") || (key === "value" && row.kind === "traffic")) return "B/s";
   if (key === "samples") return "count";
@@ -686,9 +712,12 @@ function metricName(key) {
   const knownNames = [
     "cpu-usage",
     "memory-usage",
+    "disk-throughput",
+    "network-throughput",
     "disk-bandwidth",
     "network-bandwidth",
     "network-latency.",
+    "packet-loss.",
     "rps.",
     "traffic.",
   ];
@@ -833,6 +862,10 @@ function formatRate(value) {
 
 function formatLatency(value) {
   return Number.isFinite(value) ? `${value.toFixed(3)} ms` : "n/a";
+}
+
+function formatPacketLoss(value) {
+  return Number.isFinite(value) ? `${(100 * value).toFixed(2)}%` : "n/a";
 }
 
 function formatRPS(value) {
