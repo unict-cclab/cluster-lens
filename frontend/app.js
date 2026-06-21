@@ -7,6 +7,8 @@ const statsEl = document.getElementById("stats");
 const namespaceFilter = document.getElementById("namespaceFilter");
 const groupFilter = document.getElementById("groupFilter");
 const autoRefreshToggle = document.getElementById("autoRefresh");
+const showGatewayToggle = document.getElementById("showGateway");
+const showPodLinesToggle = document.getElementById("showPodLines");
 const zoomOutButton = document.getElementById("zoomOut");
 const zoomResetButton = document.getElementById("zoomReset");
 const zoomInButton = document.getElementById("zoomIn");
@@ -33,6 +35,8 @@ let latestSnapshot = null;
 let autoRefresh = true;
 let selectedNamespace = "all";
 let selectedGroup = "all";
+let showGateway = false;
+let showPodLines = true;
 let zoom = 1;
 let viewCenter = null;
 let panState = null;
@@ -58,6 +62,14 @@ async function init() {
   });
   autoRefreshToggle.addEventListener("change", () => {
     autoRefresh = autoRefreshToggle.checked;
+  });
+  showGatewayToggle.addEventListener("change", () => {
+    showGateway = showGatewayToggle.checked;
+    if (latestSnapshot) render(latestSnapshot);
+  });
+  showPodLinesToggle.addEventListener("change", () => {
+    showPodLines = showPodLinesToggle.checked;
+    if (latestSnapshot) render(latestSnapshot);
   });
   zoomOutButton.addEventListener("click", () => changeZoom(zoom / 1.25));
   zoomResetButton.addEventListener("click", () => changeZoom(1));
@@ -128,7 +140,8 @@ function render(snapshot) {
   renderLegend(visiblePods);
 
   drawNodeEdges(averagedNodeEdges, nodePositions);
-  drawAppEdges(snapshot.appEdges, appPositions);
+  if (showGateway) drawGatewayTraffic(visiblePods, snapshot.appEdges, nodePositions, appPositions, width, height);
+  if (showPodLines) drawAppEdges(snapshot.appEdges, appPositions);
   drawNodes(snapshot.nodes, nodePositions, podsByNode);
   drawPods(visiblePods, podPositions);
 }
@@ -260,6 +273,76 @@ function drawPods(pods, podPositions) {
       class: "pod",
     }));
     graph.append(group);
+  }
+}
+
+function detectGatewayTargets(pods, appEdges) {
+  const gatewayPattern = /gateway|ingress|proxy|envoy|nginx|traefik|haproxy/i;
+  const found = new Set();
+  for (const pod of pods) {
+    const name = pod.app || pod.name || "";
+    if (gatewayPattern.test(name)) found.add(`${pod.namespace}/${pod.app || pod.name}`);
+  }
+  if (found.size > 0) return [...found];
+
+  if (appEdges && appEdges.length > 0) {
+    const sources = new Set(appEdges.map((e) => e.source));
+    const entryPoints = [...new Set(appEdges.map((e) => e.target))].filter((t) => !sources.has(t));
+    if (entryPoints.length > 0) return entryPoints;
+  }
+
+  return [];
+}
+
+function drawGatewayTraffic(visiblePods, appEdges, nodePositions, appPositions, width, height) {
+  const gatewayKeys = detectGatewayTargets(visiblePods, appEdges);
+  let targetPositions = gatewayKeys.map((key) => appPositions.get(key)).filter(Boolean);
+  if (targetPositions.length === 0) targetPositions = [...nodePositions.values()].slice(0, 3);
+  if (targetPositions.length === 0) return;
+
+  const centerX = width / 2;
+  const centerY = height / 2;
+  const avgTarget = {
+    x: targetPositions.reduce((s, p) => s + p.x, 0) / targetPositions.length,
+    y: targetPositions.reduce((s, p) => s + p.y, 0) / targetPositions.length,
+  };
+
+  const dx = avgTarget.x - centerX;
+  const dy = avgTarget.y - centerY;
+  const dist = Math.hypot(dx, dy) || 1;
+  const dirX = dx / dist;
+  const dirY = dy / dist;
+  const perpX = -dirY;
+  const perpY = dirX;
+
+  const spread = 28;
+  const extraDist = 90;
+  const userPositions = [-1, 0, 1].map((i) => ({
+    x: avgTarget.x + dirX * extraDist + perpX * (i * spread),
+    y: avgTarget.y + dirY * extraDist + perpY * (i * spread),
+  }));
+
+  const defs = svg("defs");
+  const marker = svg("marker", { id: "gateway-arrow", markerWidth: "8", markerHeight: "8", refX: "6", refY: "3", orient: "auto" });
+  marker.append(svg("path", { d: "M 0 0 L 6 3 L 0 6 z", fill: "#0891b2" }));
+  defs.append(marker);
+  graph.prepend(defs);
+
+  const centerUser = userPositions[1];
+  for (const target of targetPositions) {
+    graph.append(svg("path", {
+      d: curvedPath(centerUser, target, 18),
+      class: "gateway-edge",
+      "marker-end": "url(#gateway-arrow)",
+    }));
+  }
+
+  graph.append(svgText(centerUser.x, centerUser.y - 26, "Users", "gateway-label", "middle"));
+  for (const pos of userPositions) {
+    const g = svg("g", { class: "user-icon" });
+    g.append(svg("circle", { cx: pos.x, cy: pos.y - 8, r: 5.5 }));
+    g.append(svg("path", { d: `M ${pos.x - 10} ${pos.y + 14} C ${pos.x - 10} ${pos.y + 3} ${pos.x + 10} ${pos.y + 3} ${pos.x + 10} ${pos.y + 14}` }));
+    graph.append(g);
   }
 }
 

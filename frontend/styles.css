@@ -307,6 +307,26 @@ h1 {
   cursor: pointer;
 }
 
+.gateway-edge {
+  stroke: #0891b2;
+  stroke-width: 1.5;
+  stroke-dasharray: 5 3;
+  fill: none;
+  opacity: 0.8;
+}
+
+.gateway-label {
+  font-size: 10px;
+  fill: #0891b2;
+  font-weight: 700;
+  pointer-events: none;
+}
+
+.user-icon circle,
+.user-icon path {
+  fill: #0891b2;
+}
+
 .node-hit {
   cursor: grab;
 }
