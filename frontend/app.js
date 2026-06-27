@@ -948,7 +948,7 @@ function formatLatency(value) {
 }
 
 function formatPacketLoss(value) {
-  return Number.isFinite(value) ? `${(100 * value).toFixed(2)}%` : "n/a";
+  return Number.isFinite(value) ? `${value.toFixed(2)}%` : "n/a";
 }
 
 function formatRPS(value) {

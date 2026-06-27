@@ -7,7 +7,7 @@ func TestSelectedNodeAnnotationsMigratesThroughputNames(t *testing.T) {
 		"disk-bandwidth":               "10",
 		"network-bandwidth":            "20",
 		"network-bandwidth.node-b":     "30",
-		"packet-loss.node-b":           "0.1",
+		"packet-loss.node-b":           "10",
 		"network-latency.node-b":       "5",
 		"unrelated.example/annotation": "ignored",
 	})
@@ -16,7 +16,7 @@ func TestSelectedNodeAnnotationsMigratesThroughputNames(t *testing.T) {
 		"disk-throughput":          "10",
 		"network-throughput":       "20",
 		"network-bandwidth.node-b": "30",
-		"packet-loss.node-b":       "0.1",
+		"packet-loss.node-b":       "10",
 		"network-latency.node-b":   "5",
 	} {
 		if got := annotations[name]; got != want {
@@ -33,7 +33,7 @@ func TestAppendNodeEdgesCombinesMentatMetrics(t *testing.T) {
 	appendNodeEdges(&snap, "node-a", map[string]string{
 		"network-latency.node-b":   "5.5",
 		"network-bandwidth.node-b": "1048576",
-		"packet-loss.node-b":       "0.25",
+		"packet-loss.node-b":       "25",
 		"packet-loss.node-a":       "0",
 	})
 
@@ -47,7 +47,7 @@ func TestAppendNodeEdgesCombinesMentatMetrics(t *testing.T) {
 	if edge.Bandwidth == nil || *edge.Bandwidth != 1048576 {
 		t.Fatalf("bandwidth = %v, want 1048576", edge.Bandwidth)
 	}
-	if edge.PacketLoss == nil || *edge.PacketLoss != 0.25 {
-		t.Fatalf("packet loss = %v, want 0.25", edge.PacketLoss)
+	if edge.PacketLoss == nil || *edge.PacketLoss != 25 {
+		t.Fatalf("packet loss = %v, want 25", edge.PacketLoss)
 	}
 }
