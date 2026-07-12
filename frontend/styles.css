@@ -259,6 +259,20 @@ h1 {
   stroke-width: 2;
 }
 
+.zone-boundary {
+  fill: rgba(33, 118, 255, 0.035);
+  stroke: #a9bde0;
+  stroke-width: 1.5;
+  stroke-dasharray: 7 5;
+}
+
+.zone-label {
+  fill: #475467;
+  font-size: 13px;
+  font-weight: 700;
+  pointer-events: none;
+}
+
 .node-circle.not-ready {
   fill: #fff4ed;
   stroke: var(--danger);

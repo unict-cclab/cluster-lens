@@ -1,6 +1,9 @@
 # Cluster Lens
 
 Web UI and JSON API for Kubernetes topology, workloads, and annotated metrics.
+Nodes are automatically grouped into movable zone regions using the
+`topology.kubernetes.io/zone` label. Manual node positions remain saved per
+cluster in the browser.
 
 ## Parameters
 

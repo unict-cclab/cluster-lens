@@ -39,6 +39,7 @@ type snapshot struct {
 
 type nodeView struct {
 	Name        string            `json:"name"`
+	Zone        string            `json:"zone,omitempty"`
 	Labels      map[string]string `json:"labels,omitempty"`
 	Annotations map[string]string `json:"annotations,omitempty"`
 	Ready       bool              `json:"ready"`
@@ -176,6 +177,7 @@ func (s *server) buildSnapshot(ctx context.Context) (snapshot, error) {
 		annotations := node.Annotations
 		view := nodeView{
 			Name:        node.Name,
+			Zone:        node.Labels["topology.kubernetes.io/zone"],
 			Labels:      node.Labels,
 			Annotations: selectedNodeAnnotations(annotations),
 			Ready:       nodeReady(node),

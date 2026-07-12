@@ -139,6 +139,7 @@ function render(snapshot) {
   ].join("");
   renderLegend(visiblePods);
 
+  drawZones(snapshot.nodes, nodePositions);
   drawNodeEdges(averagedNodeEdges, nodePositions);
   if (showGateway) drawGatewayTraffic(visiblePods, snapshot.appEdges, nodePositions, appPositions, width, height);
   if (showPodLines) drawAppEdges(snapshot.appEdges, appPositions);
@@ -148,18 +149,49 @@ function render(snapshot) {
 
 function layoutNodes(nodes, width, height) {
   const positions = new Map();
-  const centerX = width / 2;
-  const centerY = height / 2;
-  const radius = Math.max(180, Math.min(centerX - nodePadding, centerY - nodePadding, Math.min(width, height) * 0.34));
-  const sorted = [...nodes].sort((a, b) => a.name.localeCompare(b.name));
-  sorted.forEach((node, index) => {
-    const angle = sorted.length === 1 ? -Math.PI / 2 : (Math.PI * 2 * index) / sorted.length - Math.PI / 2;
-    positions.set(node.name, {
-      x: centerX + Math.cos(angle) * radius,
-      y: centerY + Math.sin(angle) * radius,
+  const zones = groupBy(nodes, (node) => node.zone || "unassigned");
+  const zoneNames = [...zones.keys()].sort();
+  const columns = Math.ceil(Math.sqrt(zoneNames.length));
+  const rows = Math.ceil(zoneNames.length / columns);
+  const cellWidth = width / columns;
+  const cellHeight = height / rows;
+  zoneNames.forEach((zone, zoneIndex) => {
+    const zoneNodes = [...zones.get(zone)].sort((a, b) => a.name.localeCompare(b.name));
+    const centerX = (zoneIndex % columns + 0.5) * cellWidth;
+    const centerY = (Math.floor(zoneIndex / columns) + 0.5) * cellHeight;
+    const radius = Math.max(0, Math.min(cellWidth, cellHeight) * 0.27);
+    zoneNodes.forEach((node, index) => {
+      const angle = zoneNodes.length === 1 ? 0 : (Math.PI * 2 * index) / zoneNodes.length - Math.PI / 2;
+      const nodeRadiusFromCenter = zoneNodes.length === 1 ? 0 : radius;
+      positions.set(node.name, {
+        x: centerX + Math.cos(angle) * nodeRadiusFromCenter,
+        y: centerY + Math.sin(angle) * nodeRadiusFromCenter,
+      });
     });
   });
   return positions;
+}
+
+function drawZones(nodes, nodePositions) {
+  const byZone = groupBy(nodes, (node) => node.zone || "unassigned");
+  for (const [zone, zoneNodes] of byZone.entries()) {
+    const points = zoneNodes.map((node) => nodePositions.get(node.name)).filter(Boolean);
+    if (points.length === 0) continue;
+    const padding = nodeRadius + 48;
+    const minX = Math.min(...points.map((point) => point.x)) - padding;
+    const maxX = Math.max(...points.map((point) => point.x)) + padding;
+    const minY = Math.min(...points.map((point) => point.y)) - padding;
+    const maxY = Math.max(...points.map((point) => point.y)) + padding;
+    graph.append(svg("rect", {
+      x: minX,
+      y: minY,
+      width: maxX - minX,
+      height: maxY - minY,
+      rx: 24,
+      class: "zone-boundary",
+    }));
+    graph.append(svgText(minX + 16, minY + 24, zone, "zone-label"));
+  }
 }
 
 function layoutPods(pods, podsByNode, nodePositions) {
