@@ -3,7 +3,12 @@
 Web UI and JSON API for Kubernetes topology, workloads, and annotated metrics.
 Nodes are automatically grouped into movable zone regions using the
 `topology.kubernetes.io/zone` label. Manual node positions remain saved per
-cluster in the browser.
+cluster in the browser. Drag an empty area inside a zone boundary to move the
+whole zone anywhere on the unbounded workspace, or drag an individual node to
+fine-tune its position. Pan and zoom are unrestricted, and **Fit** frames all
+current nodes. Node-pair network measurements are aggregated into one link per
+zone pair to keep large clusters readable; selecting a zone link shows its
+averaged metrics and sample count.
 
 ## Parameters
 

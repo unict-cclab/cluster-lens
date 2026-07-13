@@ -169,7 +169,8 @@ h1 {
   cursor: grabbing;
 }
 
-#graph.is-dragging-node {
+#graph.is-dragging-node,
+#graph.is-dragging-zone {
   cursor: grabbing;
 }
 
@@ -264,12 +265,27 @@ h1 {
   stroke: #a9bde0;
   stroke-width: 1.5;
   stroke-dasharray: 7 5;
+  cursor: move;
+  pointer-events: all;
+  transition: fill 120ms ease, stroke 120ms ease;
+}
+
+.zone-boundary:hover {
+  fill: rgba(33, 118, 255, 0.08);
+  stroke: #2176ff;
 }
 
 .zone-label {
-  fill: #475467;
-  font-size: 13px;
+  fill: #344054;
+  font-size: 12px;
   font-weight: 700;
+  pointer-events: none;
+}
+
+.zone-label-background {
+  fill: #ffffff;
+  stroke: #a9bde0;
+  stroke-width: 1;
   pointer-events: none;
 }
 
@@ -314,6 +330,12 @@ h1 {
   stroke: #ffffff;
   stroke-width: 2;
   cursor: pointer;
+}
+
+.pod-label {
+  font-size: 9px;
+  fill: #475467;
+  pointer-events: none;
 }
 
 .node-hit,

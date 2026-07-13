@@ -27,8 +27,6 @@ const groupColors = [
 ];
 
 const nodeRadius = 92;
-const nodePadding = nodeRadius + 44;
-const panSlackRatio = 0.42;
 
 let refreshMs = 2000;
 let latestSnapshot = null;
@@ -42,8 +40,10 @@ let viewCenter = null;
 let panState = null;
 let suppressGraphClick = false;
 let nodeDragState = null;
+let zoneDragState = null;
 let nodePositionOverrides = new Map();
 let nodePositionContext = "";
+let fittedContext = null;
 
 init();
 
@@ -72,7 +72,7 @@ async function init() {
     if (latestSnapshot) render(latestSnapshot);
   });
   zoomOutButton.addEventListener("click", () => changeZoom(zoom / 1.25));
-  zoomResetButton.addEventListener("click", () => changeZoom(1));
+  zoomResetButton.addEventListener("click", () => fitView());
   zoomInButton.addEventListener("click", () => changeZoom(zoom * 1.25));
   graph.addEventListener("wheel", handleWheelZoom, { passive: false });
   graph.addEventListener("click", suppressClickAfterPan, true);
@@ -101,7 +101,12 @@ async function refresh() {
     const snapshot = await fetchJSON("/api/snapshot");
     latestSnapshot = snapshot;
     syncFilters(snapshot);
-    render(snapshot);
+    if (fittedContext !== snapshot.context) {
+      fittedContext = snapshot.context;
+      fitView(snapshot);
+    } else {
+      render(snapshot);
+    }
   } catch (error) {
     contextEl.textContent = error.message;
   }
@@ -128,23 +133,24 @@ function render(snapshot) {
   applyNodePositionOverrides(snapshot.context, nodePositions, width, height);
   const podPositions = layoutPods(visiblePods, podsByNode, nodePositions);
   const appPositions = layoutApps(visiblePods, podPositions);
-  const averagedNodeEdges = averageNodeEdges(snapshot.nodeEdges);
+  const zoneEdges = aggregateZoneEdges(snapshot.nodeEdges, snapshot.nodes);
+  const zonePositions = zoneCenters(snapshot.nodes, nodePositions);
 
   contextEl.textContent = `${snapshot.context} · updated ${new Date(snapshot.generatedAt).toLocaleTimeString()}`;
   statsEl.innerHTML = [
     pill(`${snapshot.nodes.length} nodes`),
     pill(`${visiblePods.length} pods`),
-    pill(`${averagedNodeEdges.length} network links`),
+    pill(`${zoneEdges.length} zone links`),
     pill(`${countGroups(visiblePods)} groups`),
   ].join("");
   renderLegend(visiblePods);
 
   drawZones(snapshot.nodes, nodePositions);
-  drawNodeEdges(averagedNodeEdges, nodePositions);
+  drawZoneEdges(zoneEdges, zonePositions);
   if (showGateway) drawGatewayTraffic(visiblePods, snapshot.appEdges, nodePositions, appPositions, width, height);
   if (showPodLines) drawAppEdges(snapshot.appEdges, appPositions);
   drawNodes(snapshot.nodes, nodePositions, podsByNode);
-  drawPods(visiblePods, podPositions);
+  drawPods(visiblePods, podPositions, nodePositions);
 }
 
 function layoutNodes(nodes, width, height) {
@@ -153,23 +159,46 @@ function layoutNodes(nodes, width, height) {
   const zoneNames = [...zones.keys()].sort();
   const columns = Math.ceil(Math.sqrt(zoneNames.length));
   const rows = Math.ceil(zoneNames.length / columns);
-  const cellWidth = width / columns;
-  const cellHeight = height / rows;
+  const largestZone = Math.max(1, ...[...zones.values()].map((zoneNodes) => zoneNodes.length));
+  const nodeColumns = Math.ceil(Math.sqrt(largestZone));
+  const nodeRows = Math.ceil(largestZone / nodeColumns);
+  const cellWidth = Math.max(360, nodeColumns * (nodeRadius * 2 + 54));
+  const cellHeight = Math.max(330, nodeRows * (nodeRadius * 2 + 54) + 50);
+  const layoutWidth = columns * cellWidth;
+  const layoutHeight = rows * cellHeight;
+  const originX = (width - layoutWidth) / 2;
+  const originY = (height - layoutHeight) / 2;
   zoneNames.forEach((zone, zoneIndex) => {
     const zoneNodes = [...zones.get(zone)].sort((a, b) => a.name.localeCompare(b.name));
-    const centerX = (zoneIndex % columns + 0.5) * cellWidth;
-    const centerY = (Math.floor(zoneIndex / columns) + 0.5) * cellHeight;
-    const radius = Math.max(0, Math.min(cellWidth, cellHeight) * 0.27);
+    const centerX = originX + (zoneIndex % columns + 0.5) * cellWidth;
+    const centerY = originY + (Math.floor(zoneIndex / columns) + 0.5) * cellHeight;
+    const columnsInZone = Math.ceil(Math.sqrt(zoneNodes.length));
+    const rowsInZone = Math.ceil(zoneNodes.length / columnsInZone);
+    const spacing = nodeRadius * 2 + 44;
     zoneNodes.forEach((node, index) => {
-      const angle = zoneNodes.length === 1 ? 0 : (Math.PI * 2 * index) / zoneNodes.length - Math.PI / 2;
-      const nodeRadiusFromCenter = zoneNodes.length === 1 ? 0 : radius;
+      const column = index % columnsInZone;
+      const row = Math.floor(index / columnsInZone);
       positions.set(node.name, {
-        x: centerX + Math.cos(angle) * nodeRadiusFromCenter,
-        y: centerY + Math.sin(angle) * nodeRadiusFromCenter,
+        x: centerX + (column - (columnsInZone - 1) / 2) * spacing,
+        y: centerY + (row - (rowsInZone - 1) / 2) * spacing,
       });
     });
   });
   return positions;
+}
+
+function zoneCenters(nodes, nodePositions) {
+  const centers = new Map();
+  const byZone = groupBy(nodes, (node) => node.zone || "unassigned");
+  for (const [zone, zoneNodes] of byZone.entries()) {
+    const points = zoneNodes.map((node) => nodePositions.get(node.name)).filter(Boolean);
+    if (points.length === 0) continue;
+    centers.set(zone, {
+      x: points.reduce((sum, point) => sum + point.x, 0) / points.length,
+      y: points.reduce((sum, point) => sum + point.y, 0) / points.length,
+    });
+  }
+  return centers;
 }
 
 function drawZones(nodes, nodePositions) {
@@ -178,19 +207,36 @@ function drawZones(nodes, nodePositions) {
     const points = zoneNodes.map((node) => nodePositions.get(node.name)).filter(Boolean);
     if (points.length === 0) continue;
     const padding = nodeRadius + 48;
+    // Pods ring nodes up to nodeRadius + 34 + 13 out, which only leaves ~1px of
+    // clearance above `padding`. The header pill needs more room than that so it
+    // doesn't overlap the topmost pod circles.
+    const headerClearance = 50;
     const minX = Math.min(...points.map((point) => point.x)) - padding;
     const maxX = Math.max(...points.map((point) => point.x)) + padding;
-    const minY = Math.min(...points.map((point) => point.y)) - padding;
+    const minY = Math.min(...points.map((point) => point.y)) - padding - headerClearance;
     const maxY = Math.max(...points.map((point) => point.y)) + padding;
-    graph.append(svg("rect", {
+    const boundary = svg("rect", {
       x: minX,
       y: minY,
       width: maxX - minX,
       height: maxY - minY,
       rx: 24,
       class: "zone-boundary",
+    });
+    boundary.addEventListener("pointerdown", (event) => startZoneDrag(event, zone, zoneNodes, nodePositions));
+    graph.append(boundary);
+    const headerWidth = Math.min(maxX - minX - 28, Math.max(96, zone.length * 7.5 + 28));
+    graph.append(svg("rect", {
+      x: minX + 14,
+      y: minY + 12,
+      width: headerWidth,
+      height: 30,
+      rx: 15,
+      class: "zone-label-background",
     }));
-    graph.append(svgText(minX + 16, minY + 24, zone, "zone-label"));
+    const maxLabelCharacters = Math.max(4, Math.floor((headerWidth - 28) / 7.5));
+    const visibleZoneLabel = zone.length > maxLabelCharacters ? `${zone.slice(0, maxLabelCharacters - 1)}…` : zone;
+    graph.append(svgText(minX + 28, minY + 32, visibleZoneLabel, "zone-label", "start"));
   }
 }
 
@@ -231,17 +277,17 @@ function layoutApps(pods, podPositions) {
   return appPositions;
 }
 
-function drawNodeEdges(edges, nodePositions) {
+function drawZoneEdges(edges, zonePositions) {
   for (const edge of edges) {
-    const source = nodePositions.get(edge.source);
-    const target = nodePositions.get(edge.target);
+    const source = zonePositions.get(edge.source);
+    const target = zonePositions.get(edge.target);
     if (!source || !target) continue;
     const path = svg("path", {
       d: curvedPath(source, target, 0),
       class: "latency-edge edge-hit",
     });
     path.addEventListener("pointerdown", stopGraphPan);
-    path.addEventListener("click", () => inspect("Network Link", edge));
+    path.addEventListener("click", () => inspect("Zone Link", edge));
     graph.append(path);
 
     const label = curvePoint(source, target, 0);
@@ -289,7 +335,7 @@ function drawNodes(nodes, nodePositions, podsByNode) {
   }
 }
 
-function drawPods(pods, podPositions) {
+function drawPods(pods, podPositions, nodePositions) {
   for (const pod of pods) {
     const pos = podPositions.get(podKey(pod));
     if (!pos) continue;
@@ -305,7 +351,33 @@ function drawPods(pods, podPositions) {
       class: "pod",
     }));
     graph.append(group);
+    graph.append(podLabelText(pod, pos, nodePositions.get(pod.node)));
   }
+}
+
+// Labels are anchored along the node->pod radial direction (rather than always
+// e.g. below the circle) so that pods fanned around the same node fan their
+// labels apart too, instead of stacking into one unreadable cluster.
+function podLabelText(pod, pos, nodeCenter) {
+  const labelOffset = 13 + 9;
+  let x = pos.x;
+  let y = pos.y + labelOffset + 3;
+  let anchor = "middle";
+  if (nodeCenter) {
+    const dx = pos.x - nodeCenter.x;
+    const dy = pos.y - nodeCenter.y;
+    const length = Math.hypot(dx, dy) || 1;
+    const ux = dx / length;
+    const uy = dy / length;
+    x = pos.x + ux * labelOffset;
+    y = pos.y + uy * labelOffset + 3;
+    anchor = ux > 0.35 ? "start" : ux < -0.35 ? "end" : "middle";
+  }
+  return svgText(x, y, truncateLabel(pod.name, 16), "pod-label", anchor);
+}
+
+function truncateLabel(text, maxChars) {
+  return text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text;
 }
 
 function detectGatewayTargets(pods, appEdges) {
@@ -422,15 +494,19 @@ function filterPods(pods) {
   });
 }
 
-function averageNodeEdges(edges) {
+function aggregateZoneEdges(edges, nodes) {
+  const nodeZones = new Map(nodes.map((node) => [node.name, node.zone || "unassigned"]));
   const pairs = new Map();
   for (const edge of edges) {
-    const names = [edge.source, edge.target].sort((a, b) => a.localeCompare(b));
-    const key = names.join("::");
+    const sourceZone = nodeZones.get(edge.source);
+    const targetZone = nodeZones.get(edge.target);
+    if (!sourceZone || !targetZone || sourceZone === targetZone) continue;
+    const zones = [sourceZone, targetZone].sort((a, b) => a.localeCompare(b));
+    const key = zones.join("::");
     if (!pairs.has(key)) {
       pairs.set(key, {
-        source: names[0],
-        target: names[1],
+        source: zones[0],
+        target: zones[1],
         kind: "network",
         values: [],
         bandwidthValues: [],
@@ -474,19 +550,35 @@ function changeZoom(nextZoom, focus = null) {
   const rect = graph.getBoundingClientRect();
   const width = Math.max(rect.width, 900);
   const height = Math.max(rect.height, 620);
-  const next = clamp(nextZoom, 0.5, 3);
+  const next = clamp(nextZoom, 0.15, 4);
 
-  if (next === 1 && !focus) {
-    viewCenter = null;
-  } else if (focus) {
+  if (focus) {
     viewCenter = zoomAroundPoint(focus, next, rect, width, height);
   } else {
     viewCenter = currentViewCenter(width, height);
   }
 
   zoom = next;
-  zoomResetButton.textContent = `${zoom.toFixed(zoom === 1 ? 0 : 1)}x`;
   if (latestSnapshot) render(latestSnapshot);
+}
+
+function fitView(snapshot = latestSnapshot) {
+  if (!snapshot) return;
+  const rect = graph.getBoundingClientRect();
+  const width = Math.max(rect.width, 900);
+  const height = Math.max(rect.height, 620);
+  const positions = layoutNodes(snapshot.nodes, width, height);
+  applyNodePositionOverrides(snapshot.context, positions, width, height);
+  const points = [...positions.values()];
+  if (points.length === 0) return;
+  const padding = nodeRadius + 90;
+  const minX = Math.min(...points.map((point) => point.x)) - padding;
+  const maxX = Math.max(...points.map((point) => point.x)) + padding;
+  const minY = Math.min(...points.map((point) => point.y)) - padding;
+  const maxY = Math.max(...points.map((point) => point.y)) + padding;
+  viewCenter = { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+  zoom = clamp(Math.min(width / (maxX - minX), height / (maxY - minY)) * 0.92, 0.15, 3);
+  render(snapshot);
 }
 
 function handleWheelZoom(event) {
@@ -497,7 +589,7 @@ function handleWheelZoom(event) {
 
 function startPan(event) {
   if (event.button !== 0) return;
-  if (nodeDragState) return;
+  if (nodeDragState || zoneDragState) return;
   panState = {
     pointerId: event.pointerId,
     x: event.clientX,
@@ -593,12 +685,9 @@ function startNodeDrag(event, nodeName, position) {
 function moveNodeDrag(event) {
   if (!nodeDragState || nodeDragState.pointerId !== event.pointerId) return;
   event.stopPropagation();
-  const rect = graph.getBoundingClientRect();
-  const width = Math.max(rect.width, 900);
-  const height = Math.max(rect.height, 620);
   const point = clientToGraphPoint(event.clientX, event.clientY);
-  const x = clamp(point.x - nodeDragState.offsetX, nodeRadius, width - nodeRadius);
-  const y = clamp(point.y - nodeDragState.offsetY, nodeRadius, height - nodeRadius);
+  const x = point.x - nodeDragState.offsetX;
+  const y = point.y - nodeDragState.offsetY;
   nodeDragState.moved = true;
   nodePositionOverrides.set(nodeDragState.nodeName, { x, y });
   saveNodePositionOverrides();
@@ -623,6 +712,60 @@ function endNodeDrag(event) {
   }
 }
 
+function startZoneDrag(event, zone, zoneNodes, nodePositions) {
+  if (event.button !== 0) return;
+  event.stopPropagation();
+  const positions = new Map();
+  for (const node of zoneNodes) {
+    const position = nodePositions.get(node.name);
+    if (position) positions.set(node.name, { ...position });
+  }
+  if (positions.size === 0) return;
+
+  zoneDragState = {
+    pointerId: event.pointerId,
+    zone,
+    start: clientToGraphPoint(event.clientX, event.clientY),
+    positions,
+    moved: false,
+  };
+  graph.setPointerCapture(event.pointerId);
+  graph.classList.add("is-dragging-zone");
+  graph.addEventListener("pointermove", moveZoneDrag);
+  graph.addEventListener("pointerup", endZoneDrag);
+  graph.addEventListener("pointercancel", endZoneDrag);
+}
+
+function moveZoneDrag(event) {
+  if (!zoneDragState || zoneDragState.pointerId !== event.pointerId) return;
+  event.stopPropagation();
+  const point = clientToGraphPoint(event.clientX, event.clientY);
+  const dx = point.x - zoneDragState.start.x;
+  const dy = point.y - zoneDragState.start.y;
+
+  zoneDragState.moved = Math.abs(dx) > 1 || Math.abs(dy) > 1;
+  for (const [nodeName, position] of zoneDragState.positions.entries()) {
+    nodePositionOverrides.set(nodeName, { x: position.x + dx, y: position.y + dy });
+  }
+  if (latestSnapshot) render(latestSnapshot);
+}
+
+function endZoneDrag(event) {
+  if (!zoneDragState || zoneDragState.pointerId !== event.pointerId) return;
+  event.stopPropagation();
+  if (graph.hasPointerCapture(event.pointerId)) graph.releasePointerCapture(event.pointerId);
+  graph.classList.remove("is-dragging-zone");
+  graph.removeEventListener("pointermove", moveZoneDrag);
+  graph.removeEventListener("pointerup", endZoneDrag);
+  graph.removeEventListener("pointercancel", endZoneDrag);
+  const wasMoved = zoneDragState.moved;
+  zoneDragState = null;
+  if (wasMoved) {
+    saveNodePositionOverrides();
+    event.preventDefault();
+  }
+}
+
 function clientToGraphPoint(clientX, clientY) {
   const rect = graph.getBoundingClientRect();
   const viewBox = graph.viewBox.baseVal;
@@ -639,8 +782,8 @@ function applyNodePositionOverrides(context, nodePositions, width, height) {
   for (const [nodeName, position] of nodePositionOverrides.entries()) {
     if (!nodePositions.has(nodeName)) continue;
     nodePositions.set(nodeName, {
-      x: clamp(position.x, 78, width - 78),
-      y: clamp(position.y, nodeRadius, height - nodeRadius),
+      x: Number(position.x),
+      y: Number(position.y),
     });
   }
 }
@@ -686,15 +829,7 @@ function updateViewBox(width, height) {
 
 function currentViewCenter(width, height) {
   const fallback = { x: width / 2, y: height / 2 };
-  if (!viewCenter) return fallback;
-  const viewWidth = width / zoom;
-  const viewHeight = height / zoom;
-  const slackX = viewWidth * panSlackRatio;
-  const slackY = viewHeight * panSlackRatio;
-  return {
-    x: clamp(viewCenter.x, viewWidth / 2 - slackX, width - viewWidth / 2 + slackX),
-    y: clamp(viewCenter.y, viewHeight / 2 - slackY, height - viewHeight / 2 + slackY),
-  };
+  return viewCenter || fallback;
 }
 
 function zoomAroundPoint(focus, nextZoom, rect, width, height) {
@@ -709,8 +844,8 @@ function zoomAroundPoint(focus, nextZoom, rect, width, height) {
   const focusY = currentCenter.y - currentViewHeight / 2 + ratioY * currentViewHeight;
 
   return {
-    x: clamp(focusX - (ratioX - 0.5) * nextViewWidth, nextViewWidth / 2, width - nextViewWidth / 2),
-    y: clamp(focusY - (ratioY - 0.5) * nextViewHeight, nextViewHeight / 2, height - nextViewHeight / 2),
+    x: focusX - (ratioX - 0.5) * nextViewWidth,
+    y: focusY - (ratioY - 0.5) * nextViewHeight,
   };
 }
 
