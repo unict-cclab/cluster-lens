@@ -350,6 +350,9 @@ function drawPods(pods, podPositions, nodePositions) {
       fill: podColor(pod),
       class: "pod",
     }));
+    if (pod.index) {
+      group.append(svgText(pos.x, pos.y + 3, truncateLabel(pod.index, 4), "pod-index", "middle"));
+    }
     graph.append(group);
     graph.append(podLabelText(pod, pos, nodePositions.get(pod.node)));
   }

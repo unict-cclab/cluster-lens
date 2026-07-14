@@ -57,6 +57,7 @@ type podView struct {
 	Phase      string            `json:"phase,omitempty"`
 	Group      string            `json:"group,omitempty"`
 	App        string            `json:"app,omitempty"`
+	Index      string            `json:"index,omitempty"`
 	Owner      string            `json:"owner,omitempty"`
 	Labels     map[string]string `json:"labels,omitempty"`
 	Metrics    map[string]string `json:"metrics,omitempty"`
@@ -217,6 +218,7 @@ func (s *server) buildSnapshot(ctx context.Context) (snapshot, error) {
 			Phase:      string(pod.Status.Phase),
 			Group:      labels["group"],
 			App:        labelOr(labels, "app", owner),
+			Index:      labels["index"],
 			Owner:      owner,
 			Labels:     labels,
 			Metrics:    metrics,

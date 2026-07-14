@@ -1,5 +1,8 @@
 # Cluster Lens
 
+Pod circles display the value of the pod's `index` label when present. The
+same value is available as a top-level field in the pod inspector.
+
 Web UI and JSON API for Kubernetes topology, workloads, and annotated metrics.
 Nodes are automatically grouped into movable zone regions using the
 `topology.kubernetes.io/zone` label. Manual node positions remain saved per

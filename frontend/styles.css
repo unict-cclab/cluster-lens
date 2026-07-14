@@ -338,6 +338,13 @@ h1 {
   pointer-events: none;
 }
 
+.pod-index {
+  font-size: 8px;
+  font-weight: 700;
+  fill: #ffffff;
+  pointer-events: none;
+}
+
 .node-hit,
 .edge-hit {
   cursor: pointer;
